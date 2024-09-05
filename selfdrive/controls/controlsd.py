@@ -55,20 +55,223 @@ IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 CSID_MAP = {"1": EventName.roadCameraError, "2": EventName.wideRoadCameraError, "0": EventName.driverCameraError}
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
+class RealControls:
+  def __init__(self, sm, pm) -> None:
+    cloudlog.info("controlsd is waiting for CarParams")
+    self.CP = messaging.log_from_bytes(Params().get("CarParams", block=True), car.CarParams)
+    cloudlog.info("controlsd got CarParams")
+
+    self.CI = get_car_interface(self.CP)
+
+    self.sm = sm
+    self.pm = pm
+
+    self.steer_limited = False
+    self.desired_curvature = 0.0
+
+    self.pose_calibrator = PoseCalibrator()
+    self.calibrated_pose: Pose|None = None
+
+    # TODO: fix these
+    self.active = False
+    self.enabled = False
+    self.joystick_mode = False
+    self.events = Events()
+
+    self.LoC = LongControl(self.CP)
+    self.VM = VehicleModel(self.CP)
+    self.LaC: LatControl
+    if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+      self.LaC = LatControlAngle(self.CP, self.CI)
+    elif self.CP.lateralTuning.which() == 'pid':
+      self.LaC = LatControlPID(self.CP, self.CI)
+    elif self.CP.lateralTuning.which() == 'torque':
+      self.LaC = LatControlTorque(self.CP, self.CI)
+
+  def update(self):
+    # self.sm.update(0)
+
+    if self.sm.updated["liveCalibration"]:
+      self.pose_calibrator.feed_live_calib(self.sm['liveCalibration'])
+    if self.sm.updated["livePose"]:
+      device_pose = Pose.from_live_pose(self.sm['livePose'])
+      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
+
+  def state_control(self, CS):
+    """Given the state, this function returns a CarControl packet"""
+
+    # Update VehicleModel
+    lp = self.sm['liveParameters']
+    x = max(lp.stiffnessFactor, 0.1)
+    sr = max(lp.steerRatio, 0.1)
+    self.VM.update_params(x, sr)
+
+    # Update Torque Params
+    if self.CP.lateralTuning.which() == 'torque':
+      torque_params = self.sm['liveTorqueParameters']
+      if self.sm.all_checks(['liveTorqueParameters']) and torque_params.useParams:
+        self.LaC.update_live_torque_params(torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered,
+                                           torque_params.frictionCoefficientFiltered)
+
+    long_plan = self.sm['longitudinalPlan']
+    model_v2 = self.sm['modelV2']
+
+    CC = car.CarControl.new_message()
+    CC.enabled = self.enabled
+
+    # Check which actuators can be enabled
+    standstill = CS.vEgo <= max(self.CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED) or CS.standstill
+    CC.latActive = self.active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
+                   (not standstill or self.joystick_mode)
+    CC.longActive = self.enabled and not self.events.contains(ET.OVERRIDE_LONGITUDINAL) and self.CP.openpilotLongitudinalControl
+
+    actuators = CC.actuators
+    actuators.longControlState = self.LoC.long_control_state
+
+    # Enable blinkers while lane changing
+    if model_v2.meta.laneChangeState != LaneChangeState.off:
+      CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
+      CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
+
+    if CS.leftBlinker or CS.rightBlinker:
+      self.last_blinker_frame = self.sm.frame
+
+    if not CC.latActive:
+      self.LaC.reset()
+    if not CC.longActive:
+      self.LoC.reset()
+
+    if not self.joystick_mode:
+      # accel PID loop
+      pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
+      actuators.accel = self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits)
+
+      # Steering PID loop and lateral MPC
+      self.desired_curvature = clip_curvature(CS.vEgo, self.desired_curvature, model_v2.action.desiredCurvature)
+      actuators.curvature = self.desired_curvature
+      actuators.steer, actuators.steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                                             self.steer_limited, self.desired_curvature,
+                                                                             self.calibrated_pose) # TODO what if not available
+    else:
+      lac_log = log.ControlsState.LateralDebugState.new_message()
+      if self.sm.recv_frame['testJoystick'] > 0:
+        # reset joystick if it hasn't been received in a while
+        should_reset_joystick = (self.sm.frame - self.sm.recv_frame['testJoystick'])*DT_CTRL > 0.2
+        if not should_reset_joystick:
+          joystick_axes = self.sm['testJoystick'].axes
+        else:
+          joystick_axes = [0.0, 0.0]
+
+        if CC.longActive:
+          actuators.accel = 4.0*clip(joystick_axes[0], -1, 1)
+
+        if CC.latActive:
+          max_curvature = JOYSTICK_MAX_LAT_ACCEL / max(CS.vEgo ** 2, 1)
+          max_angle = math.degrees(self.VM.get_steer_from_curvature(max_curvature, CS.vEgo, lp.roll))
+
+          steer = clip(joystick_axes[1], -1, 1)
+          actuators.steer, actuators.steeringAngleDeg, actuators.curvature = steer, steer * max_angle, steer * -max_curvature
+
+        lac_log.active = self.active
+        lac_log.steeringAngleDeg = CS.steeringAngleDeg
+        lac_log.output = actuators.steer
+        lac_log.saturated = abs(actuators.steer) >= 0.9
+
+    # Ensure no NaNs/Infs
+    for p in ACTUATOR_FIELDS:
+      attr = getattr(actuators, p)
+      if not isinstance(attr, SupportsFloat):
+        continue
+
+      if not math.isfinite(attr):
+        cloudlog.error(f"actuators.{p} not finite {actuators.to_dict()}")
+        setattr(actuators, p, 0.0)
+
+    return CC, lac_log
+
+  def publish(self, CS, CC, lac_log):
+    # Orientation and angle rates can be useful for carcontroller
+    # Only calibrated (car) frame is relevant for the carcontroller
+    if self.calibrated_pose is not None:
+      CC.orientationNED = self.calibrated_pose.orientation.xyz.tolist()
+      CC.angularVelocity = self.calibrated_pose.angular_velocity.xyz.tolist()
+
+    CC.cruiseControl.override = self.enabled and not CC.longActive and self.CP.openpilotLongitudinalControl
+    CC.cruiseControl.cancel = CS.cruiseState.enabled and (not self.enabled or not self.CP.pcmCruise)
+    if self.joystick_mode and self.sm.recv_frame['testJoystick'] > 0 and self.sm['testJoystick'].buttons[0]:
+      CC.cruiseControl.cancel = True
+
+    speeds = self.sm['longitudinalPlan'].speeds
+    if len(speeds):
+      CC.cruiseControl.resume = self.enabled and CS.cruiseState.standstill and speeds[-1] > 0.1
+
+    hudControl = CC.hudControl
+    hudControl.setSpeed = float(CS.vCruiseCluster * CV.KPH_TO_MS)
+    hudControl.speedVisible = self.enabled
+    hudControl.lanesVisible = self.enabled
+    hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
+    hudControl.leadDistanceBars = self.personality + 1
+
+    hudControl.rightLaneVisible = True
+    hudControl.leftLaneVisible = True
+
+    # TODO: fix this
+    #if self.sm.valid['modelV2'] and CS.canValid and self.is_ldw_enabled and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated:
+    #  hudControl.leftLaneDepart = self.ldw.left
+    #  hudControl.rightLaneDepart = self.ldw.right
+    #if self.AM.current_alert:
+    #  hudControl.visualAlert = self.AM.current_alert.visual_alert
+
+    if self.sm['carOutput'].active:
+      CO = self.sm['carOutput']
+      if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+        self.steer_limited = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
+                             STEER_ANGLE_SATURATION_THRESHOLD
+      else:
+        self.steer_limited = abs(CC.actuators.steer - CO.actuatorsOutput.steer) > 1e-2
+
+    # controlsState
+    dat = messaging.new_message('controlsState')
+    dat.valid = CS.canValid
+    cs = dat.controlsState
+
+    lp = self.sm['liveParameters']
+    steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
+    cs.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
+
+    cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
+    cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
+    cs.desiredCurvature = self.desired_curvature
+    cs.longControlState = self.LoC.long_control_state
+    cs.upAccelCmd = float(self.LoC.pid.p)
+    cs.uiAccelCmd = float(self.LoC.pid.i)
+    cs.ufAccelCmd = float(self.LoC.pid.f)
+    cs.cumLagMs = -self.rk.remaining * 1000.
+    cs.forceDecel = bool((self.sm['driverMonitoringState'].awarenessStatus < 0.) or
+                         (self.state_machine.state == State.softDisabling))
+
+    lat_tuning = self.CP.lateralTuning.which()
+    if self.joystick_mode:
+      cs.lateralControlState.debugState = lac_log
+    elif self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+      cs.lateralControlState.angleState = lac_log
+    elif lat_tuning == 'pid':
+      cs.lateralControlState.pidState = lac_log
+    elif lat_tuning == 'torque':
+      cs.lateralControlState.torqueState = lac_log
+
+    self.pm.send('controlsState', dat)
+
+    # carControl
+    cc_send = messaging.new_message('carControl')
+    cc_send.valid = CS.canValid
+    cc_send.carControl = CC
+    self.pm.send('carControl', cc_send)
+
 
 class Controls:
   def __init__(self, CI=None):
     self.params = Params()
-
-    if CI is None:
-      cloudlog.info("controlsd is waiting for CarParams")
-      self.CP = messaging.log_from_bytes(self.params.get("CarParams", block=True), car.CarParams)
-      cloudlog.info("controlsd got CarParams")
-
-      # Uses car interface helper functions, altering state won't be considered by card for actuation
-      self.CI = get_car_interface(self.CP)
-    else:
-      self.CI, self.CP = CI, CI.CP
 
     # Ensure the current branch is cached, otherwise the first iteration of controlsd lags
     self.branch = get_short_branch()
@@ -99,6 +302,9 @@ class Controls:
                                   ignore_alive=ignore, ignore_avg_freq=ignore+['radarState', 'testJoystick'], ignore_valid=['testJoystick', ],
                                   frequency=int(1/DT_CTRL))
 
+    self.real_controls = RealControls(self.sm, self.pm)
+    self.CP = self.real_controls.CP
+
     self.joystick_mode = self.params.get_bool("JoystickDebugMode")
 
     # read params
@@ -122,21 +328,7 @@ class Controls:
     self.AM = AlertManager()
     self.events = Events()
 
-    self.pose_calibrator = PoseCalibrator()
-    self.calibrated_pose: Pose|None = None
-
-    self.LoC = LongControl(self.CP)
-    self.VM = VehicleModel(self.CP)
-
     self.ldw = LaneDepartureWarning()
-
-    self.LaC: LatControl
-    if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
-      self.LaC = LatControlAngle(self.CP, self.CI)
-    elif self.CP.lateralTuning.which() == 'pid':
-      self.LaC = LatControlPID(self.CP, self.CI)
-    elif self.CP.lateralTuning.which() == 'torque':
-      self.LaC = LatControlTorque(self.CP, self.CI)
 
     self.initialized = False
     self.enabled = False
@@ -149,8 +341,6 @@ class Controls:
     self.events_prev = []
     self.logged_comm_issue = None
     self.not_running_prev = None
-    self.steer_limited = False
-    self.desired_curvature = 0.0
     self.experimental_mode = False
     self.personality = self.read_personality_param()
     self.recalibrating_seen = False
@@ -464,108 +654,7 @@ class Controls:
            if ps.safetyModel not in IGNORED_SAFETY_MODES):
       self.mismatch_counter += 1
 
-    # calibrate the live pose and save it for later use
-    if self.sm.updated["liveCalibration"]:
-      self.pose_calibrator.feed_live_calib(self.sm['liveCalibration'])
-    if self.sm.updated["livePose"]:
-      device_pose = Pose.from_live_pose(self.sm['livePose'])
-      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
-
     return CS
-
-  def state_control(self, CS):
-    """Given the state, this function returns a CarControl packet"""
-
-    # Update VehicleModel
-    lp = self.sm['liveParameters']
-    x = max(lp.stiffnessFactor, 0.1)
-    sr = max(lp.steerRatio, 0.1)
-    self.VM.update_params(x, sr)
-
-    # Update Torque Params
-    if self.CP.lateralTuning.which() == 'torque':
-      torque_params = self.sm['liveTorqueParameters']
-      if self.sm.all_checks(['liveTorqueParameters']) and torque_params.useParams:
-        self.LaC.update_live_torque_params(torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered,
-                                           torque_params.frictionCoefficientFiltered)
-
-    long_plan = self.sm['longitudinalPlan']
-    model_v2 = self.sm['modelV2']
-
-    CC = car.CarControl.new_message()
-    CC.enabled = self.enabled
-
-    # Check which actuators can be enabled
-    standstill = CS.vEgo <= max(self.CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED) or CS.standstill
-    CC.latActive = self.active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
-                   (not standstill or self.joystick_mode)
-    CC.longActive = self.enabled and not self.events.contains(ET.OVERRIDE_LONGITUDINAL) and self.CP.openpilotLongitudinalControl
-
-    actuators = CC.actuators
-    actuators.longControlState = self.LoC.long_control_state
-
-    # Enable blinkers while lane changing
-    if model_v2.meta.laneChangeState != LaneChangeState.off:
-      CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
-      CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
-
-    if CS.leftBlinker or CS.rightBlinker:
-      self.last_blinker_frame = self.sm.frame
-
-    # State specific actions
-
-    if not CC.latActive:
-      self.LaC.reset()
-    if not CC.longActive:
-      self.LoC.reset()
-
-    if not self.joystick_mode:
-      # accel PID loop
-      pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
-      actuators.accel = self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits)
-
-      # Steering PID loop and lateral MPC
-      self.desired_curvature = clip_curvature(CS.vEgo, self.desired_curvature, model_v2.action.desiredCurvature)
-      actuators.curvature = self.desired_curvature
-      actuators.steer, actuators.steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                                             self.steer_limited, self.desired_curvature,
-                                                                             self.calibrated_pose) # TODO what if not available
-    else:
-      lac_log = log.ControlsState.LateralDebugState.new_message()
-      if self.sm.recv_frame['testJoystick'] > 0:
-        # reset joystick if it hasn't been received in a while
-        should_reset_joystick = (self.sm.frame - self.sm.recv_frame['testJoystick'])*DT_CTRL > 0.2
-        if not should_reset_joystick:
-          joystick_axes = self.sm['testJoystick'].axes
-        else:
-          joystick_axes = [0.0, 0.0]
-
-        if CC.longActive:
-          actuators.accel = 4.0*clip(joystick_axes[0], -1, 1)
-
-        if CC.latActive:
-          max_curvature = JOYSTICK_MAX_LAT_ACCEL / max(CS.vEgo ** 2, 1)
-          max_angle = math.degrees(self.VM.get_steer_from_curvature(max_curvature, CS.vEgo, lp.roll))
-
-          steer = clip(joystick_axes[1], -1, 1)
-          actuators.steer, actuators.steeringAngleDeg, actuators.curvature = steer, steer * max_angle, steer * -max_curvature
-
-        lac_log.active = self.active
-        lac_log.steeringAngleDeg = CS.steeringAngleDeg
-        lac_log.output = actuators.steer
-        lac_log.saturated = abs(actuators.steer) >= 0.9
-
-    # Ensure no NaNs/Infs
-    for p in ACTUATOR_FIELDS:
-      attr = getattr(actuators, p)
-      if not isinstance(attr, SupportsFloat):
-        continue
-
-      if not math.isfinite(attr):
-        cloudlog.error(f"actuators.{p} not finite {actuators.to_dict()}")
-        setattr(actuators, p, 0.0)
-
-    return CC, lac_log
 
   def update_alerts(self, CS):
     clear_event_types = set()
@@ -579,86 +668,6 @@ class Controls:
                                                                                 self.state_machine.soft_disable_timer, pers])
     self.AM.add_many(self.sm.frame, alerts)
     self.AM.process_alerts(self.sm.frame, clear_event_types)
-
-  def publish_carControl(self, CS, CC, lac_log):
-    # Orientation and angle rates can be useful for carcontroller
-    # Only calibrated (car) frame is relevant for the carcontroller
-    if self.calibrated_pose is not None:
-      CC.orientationNED = self.calibrated_pose.orientation.xyz.tolist()
-      CC.angularVelocity = self.calibrated_pose.angular_velocity.xyz.tolist()
-
-    CC.cruiseControl.override = self.enabled and not CC.longActive and self.CP.openpilotLongitudinalControl
-    CC.cruiseControl.cancel = CS.cruiseState.enabled and (not self.enabled or not self.CP.pcmCruise)
-    if self.joystick_mode and self.sm.recv_frame['testJoystick'] > 0 and self.sm['testJoystick'].buttons[0]:
-      CC.cruiseControl.cancel = True
-
-    speeds = self.sm['longitudinalPlan'].speeds
-    if len(speeds):
-      CC.cruiseControl.resume = self.enabled and CS.cruiseState.standstill and speeds[-1] > 0.1
-
-    hudControl = CC.hudControl
-    hudControl.setSpeed = float(CS.vCruiseCluster * CV.KPH_TO_MS)
-    hudControl.speedVisible = self.enabled
-    hudControl.lanesVisible = self.enabled
-    hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
-    hudControl.leadDistanceBars = self.personality + 1
-
-    hudControl.rightLaneVisible = True
-    hudControl.leftLaneVisible = True
-
-    if self.sm.valid['modelV2'] and CS.canValid and self.is_ldw_enabled and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated:
-      hudControl.leftLaneDepart = self.ldw.left
-      hudControl.rightLaneDepart = self.ldw.right
-
-    if self.AM.current_alert:
-      hudControl.visualAlert = self.AM.current_alert.visual_alert
-
-    if not self.CP.passive and self.initialized:
-      CO = self.sm['carOutput']
-      if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
-        self.steer_limited = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
-                             STEER_ANGLE_SATURATION_THRESHOLD
-      else:
-        self.steer_limited = abs(CC.actuators.steer - CO.actuatorsOutput.steer) > 1e-2
-
-
-    # controlsState
-    dat = messaging.new_message('controlsState')
-    dat.valid = CS.canValid
-    cs = dat.controlsState
-
-    lp = self.sm['liveParameters']
-    steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
-    cs.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
-
-    cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
-    cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
-    cs.desiredCurvature = self.desired_curvature
-    cs.longControlState = self.LoC.long_control_state
-    cs.upAccelCmd = float(self.LoC.pid.p)
-    cs.uiAccelCmd = float(self.LoC.pid.i)
-    cs.ufAccelCmd = float(self.LoC.pid.f)
-    cs.cumLagMs = -self.rk.remaining * 1000.
-    cs.forceDecel = bool((self.sm['driverMonitoringState'].awarenessStatus < 0.) or
-                         (self.state_machine.state == State.softDisabling))
-
-    lat_tuning = self.CP.lateralTuning.which()
-    if self.joystick_mode:
-      cs.lateralControlState.debugState = lac_log
-    elif self.CP.steerControlType == car.CarParams.SteerControlType.angle:
-      cs.lateralControlState.angleState = lac_log
-    elif lat_tuning == 'pid':
-      cs.lateralControlState.pidState = lac_log
-    elif lat_tuning == 'torque':
-      cs.lateralControlState.torqueState = lac_log
-
-    self.pm.send('controlsState', dat)
-
-    # carControl
-    cc_send = messaging.new_message('carControl')
-    cc_send.valid = CS.canValid
-    cc_send.carControl = CC
-    self.pm.send('carControl', cc_send)
 
   def publish_selfdriveState(self, CS):
     # selfdriveState
@@ -690,16 +699,17 @@ class Controls:
 
   def step(self):
     CS = self.data_sample()
+    self.real_controls.update()
     self.update_events(CS)
     if not self.CP.passive and self.initialized:
       self.enabled, self.active = self.state_machine.update(self.events)
     self.update_alerts(CS)
 
     # Compute actuators (runs PID loops and lateral MPC)
-    CC, lac_log = self.state_control(CS)
+    CC, lac_log = self.real_controls.state_control(CS)
 
     # Publish data
-    self.publish_carControl(CS, CC, lac_log)
+    self.real_controls.publish(CS, CC, lac_log)
     self.publish_selfdriveState(CS)
 
     self.CS_prev = CS
