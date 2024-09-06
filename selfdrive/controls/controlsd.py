@@ -38,7 +38,7 @@ class Controls:
 
     self.sm = messaging.SubMaster(['liveParameters', 'liveTorqueParameters', 'modelV2', 'selfdriveState',
                                    'liveCalibration', 'livePose', 'longitudinalPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents'])
+                                   'driverMonitoringState', 'onroadEvents'], poll='carState')
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited = False
@@ -58,7 +58,7 @@ class Controls:
       self.LaC = LatControlTorque(self.CP, self.CI)
 
   def update(self):
-    self.sm.update(0)
+    self.sm.update(10)
     if self.sm.updated["liveCalibration"]:
       self.pose_calibrator.feed_live_calib(self.sm['liveCalibration'])
     if self.sm.updated["livePose"]:

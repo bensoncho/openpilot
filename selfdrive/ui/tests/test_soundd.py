@@ -1,7 +1,7 @@
 from cereal import car
 from cereal import messaging
 from cereal.messaging import SubMaster, PubMaster
-from openpilot.selfdrive.ui.soundd import CONTROLS_TIMEOUT, check_controls_timeout_alert
+from openpilot.selfdrive.ui.soundd import SELFDRIVE_TIMEOUT, check_controls_timeout_alert
 
 import time
 
@@ -25,7 +25,7 @@ class TestSoundd:
 
       assert not check_controls_timeout_alert(sm)
 
-    for _ in range(CONTROLS_TIMEOUT * 110):
+    for _ in range(SELFDRIVE_TIMEOUT * 110):
       sm.update(0)
       time.sleep(0.01)
 
