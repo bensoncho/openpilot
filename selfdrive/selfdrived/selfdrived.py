@@ -20,30 +20,59 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.gps import get_gps_location_service
 
 from opendbc.car.car_helpers import get_car_interface
-from openpilot.selfdrive.controls.lib.alertmanager import AlertManager, set_offroad_alert
-from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature, get_startup_event
+from openpilot.selfdrive.controls.lib.drive_helpers import get_startup_event
 from openpilot.selfdrive.controls.lib.ldw import LaneDepartureWarning
-from openpilot.selfdrive.controls.lib.events import Events, ET
-from openpilot.selfdrive.controls.lib.latcontrol import LatControl, MIN_LATERAL_CONTROL_SPEED
-from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
-from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
-from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
-from openpilot.selfdrive.controls.lib.longcontrol import LongControl
-from openpilot.selfdrive.controls.lib.vehicle_model import VehicleModel
-from openpilot.selfdrive.controls.lib.selfdrive import StateMachine
-from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
+from openpilot.selfdrive.selfdrived.events import Events, ET
+from openpilot.selfdrive.selfdrived.state import StateMachine
+from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 
 from openpilot.system.hardware import HARDWARE
+from openpilot.system.version import get_build_metadata
+
+REPLAY = "REPLAY" in os.environ
+SIMULATION = "SIMULATION" in os.environ
+TESTING_CLOSET = "TESTING_CLOSET" in os.environ
+IGNORE_PROCESSES = {"loggerd", "encoderd", "statsd"}
+
+ThermalStatus = log.DeviceState.ThermalStatus
+State = log.SelfdriveState.OpenpilotState
+PandaType = log.PandaState.PandaType
+LaneChangeState = log.LaneChangeState
+LaneChangeDirection = log.LaneChangeDirection
+EventName = car.OnroadEvent.EventName
+ButtonType = car.CarState.ButtonEvent.Type
+SafetyModel = car.CarParams.SafetyModel
+
+IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
+CSID_MAP = {"1": EventName.roadCameraError, "2": EventName.wideRoadCameraError, "0": EventName.driverCameraError}
+ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
+
+def get_startup_event(car_recognized, controller_available, fw_seen):
+  build_metadata = get_build_metadata()
+  if build_metadata.openpilot.comma_remote and build_metadata.tested_channel:
+    event = EventName.startup
+  else:
+    event = EventName.startupMaster
+
+  if not car_recognized:
+    if fw_seen:
+      event = EventName.startupNoCar
+    else:
+      event = EventName.startupNoFw
+  elif car_recognized and not controller_available:
+    event = EventName.startupNoControl
+  return event
+
 
 class SelfdriveD:
-  def __init__(self, CI=None):
+  def __init__(self):
     self.params = Params()
 
-    # Ensure the current branch is cached, otherwise the first iteration of controlsd lags
+    # Ensure the current branch is cached, otherwise the first cycle lags
     self.branch = get_short_branch()
 
     # Setup sockets
-    self.pm = messaging.PubMaster(['selfdriveState', 'controlsState', 'carControl', 'onroadEvents'])
+    self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'])
 
     self.gps_location_service = get_gps_location_service(self.params)
     self.gps_packets = [self.gps_location_service]
@@ -52,7 +81,7 @@ class SelfdriveD:
 
     self.log_sock = messaging.sub_sock('androidLog')
 
-    # TODO: de-couple controlsd with card/conflate on carState without introducing controls mismatches
+    # TODO: de-couple seldrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
     ignore = self.sensor_packets + self.gps_packets + ['testJoystick']
@@ -70,8 +99,6 @@ class SelfdriveD:
 
     self.real_controls = RealControls(self.sm, self.pm)
     self.CP = self.real_controls.CP
-
-    self.joystick_mode = self.params.get_bool("JoystickDebugMode")
 
     # read params
     self.is_metric = self.params.get_bool("IsMetric")
@@ -127,7 +154,7 @@ class SelfdriveD:
     elif self.CP.passive:
       self.events.add(EventName.dashcamMode, static=True)
 
-    # controlsd is driven by carState, expected at 100Hz
+    # seldrived is driven by carState, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
   def set_initial_state(self):
@@ -139,8 +166,7 @@ class SelfdriveD:
 
     self.events.clear()
 
-    # Add joystick event, static on cars, dynamic on nonCars
-    if self.joystick_mode:
+    if self.sm['controlsState'].lateralControlState.which() == 'debugState':
       self.events.add(EventName.joystickDebug)
       self.startup_event = None
 
@@ -256,7 +282,7 @@ class SelfdriveD:
         elif not self.sm.all_freq_ok(self.camera_packets):
           self.events.add(EventName.cameraFrameRate)
     if not REPLAY and self.rk.lagging:
-      self.events.add(EventName.controlsdLagging)
+      self.events.add(EventName.seldrivedLagging)
     if len(self.sm['radarState'].radarErrors) or ((not self.rk.lagging or REPLAY) and not self.sm.all_checks(['radarState'])):
       self.events.add(EventName.radarFault)
     if not self.sm.valid['pandaStates']:
@@ -377,8 +403,6 @@ class SelfdriveD:
         self.events.add(EventName.personalityChanged)
 
   def data_sample(self):
-    """Receive data from sockets"""
-
     car_state = messaging.recv_one(self.car_state_sock)
     CS = car_state.carState if car_state else self.CS_prev
 
@@ -398,7 +422,7 @@ class SelfdriveD:
         self.set_initial_state()
 
         cloudlog.event(
-          "controlsd.initialized",
+          "seldrived.initialized",
           dt=self.sm.frame*DT_CTRL,
           timeout=timed_out,
           canValid=CS.canValid,
@@ -408,7 +432,7 @@ class SelfdriveD:
           error=True,
         )
 
-    # When the panda and controlsd do not agree on controls_allowed
+    # When the panda and seldrived do not agree on controls_allowed
     # we want to disengage openpilot. However the status from the panda goes through
     # another socket other than the CAN messages and one can arrive earlier than the other.
     # Therefore we allow a mismatch for two samples, then we trigger the disengagement.
@@ -470,16 +494,10 @@ class SelfdriveD:
       self.enabled, self.active = self.state_machine.update(self.events)
     self.update_alerts(CS)
 
-    # Compute actuators (runs PID loops and lateral MPC)
-    CC, lac_log = self.real_controls.state_control(CS)
-
-    # Publish data
-    self.real_controls.publish(CS, CC, lac_log)
     self.publish_selfdriveState(CS)
 
     self.CS_prev = CS
     self.CC_prev = CC
-    self.lac_log_prev = lac_log
 
   def read_personality_param(self):
     try:
@@ -492,8 +510,6 @@ class SelfdriveD:
       self.is_metric = self.params.get_bool("IsMetric")
       self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
       self.personality = self.read_personality_param()
-      if self.CP.notCar:
-        self.joystick_mode = self.params.get_bool("JoystickDebugMode")
       time.sleep(0.1)
 
   def run(self):
