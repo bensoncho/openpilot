@@ -20,7 +20,6 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.gps import get_gps_location_service
 
 from opendbc.car.car_helpers import get_car_interface
-from openpilot.selfdrive.controls.lib.drive_helpers import get_startup_event
 from openpilot.selfdrive.controls.lib.ldw import LaneDepartureWarning
 from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.state import StateMachine
@@ -45,7 +44,6 @@ SafetyModel = car.CarParams.SafetyModel
 
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 CSID_MAP = {"1": EventName.roadCameraError, "2": EventName.wideRoadCameraError, "0": EventName.driverCameraError}
-ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
 def get_startup_event(car_recognized, controller_available, fw_seen):
   build_metadata = get_build_metadata()
@@ -71,6 +69,10 @@ class SelfdriveD:
     # Ensure the current branch is cached, otherwise the first cycle lags
     self.branch = get_short_branch()
 
+    cloudlog.info("selfdrived is waiting for CarParams")
+    self.CP = messaging.log_from_bytes(self.params.get("CarParams", block=True), car.CarParams)
+    cloudlog.info("selfdrived got CarParams")
+
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'])
 
@@ -84,7 +86,7 @@ class SelfdriveD:
     # TODO: de-couple seldrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
-    ignore = self.sensor_packets + self.gps_packets + ['testJoystick']
+    ignore = self.sensor_packets + self.gps_packets
     if SIMULATION:
       ignore += ['driverCameraState', 'managerState']
     if REPLAY:
@@ -93,12 +95,10 @@ class SelfdriveD:
     self.sm = messaging.SubMaster(['deviceState', 'pandaStates', 'peripheralState', 'modelV2', 'liveCalibration',
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'livePose',
                                    'managerState', 'liveParameters', 'radarState', 'liveTorqueParameters',
-                                   'testJoystick'] + self.camera_packets + self.sensor_packets + self.gps_packets,
-                                  ignore_alive=ignore, ignore_avg_freq=ignore+['radarState', 'testJoystick'], ignore_valid=['testJoystick', ],
+                                   'controlsState', 'carControl'] + \
+                                   self.camera_packets + self.sensor_packets + self.gps_packets,
+                                  ignore_alive=ignore, ignore_avg_freq=ignore+['radarState',],
                                   frequency=int(1/DT_CTRL))
-
-    self.real_controls = RealControls(self.sm, self.pm)
-    self.CP = self.real_controls.CP
 
     # read params
     self.is_metric = self.params.get_bool("IsMetric")
@@ -116,7 +116,6 @@ class SelfdriveD:
       self.params.remove("ExperimentalMode")
 
     self.CS_prev = car.CarState.new_message()
-    self.CC_prev = car.CarControl.new_message()
     self.lac_log_prev = None
     self.AM = AlertManager()
     self.events = Events()
@@ -228,7 +227,7 @@ class SelfdriveD:
 
     # Lane departure warning
     if self.sm.valid['modelV2'] and CS.canValid:
-      self.ldw.update(self.sm.frame, self.sm['modelV2'], CS, self.CC_prev)
+      self.ldw.update(self.sm.frame, self.sm['modelV2'], CS, self.sm['carControl'])
       if self.is_ldw_enabled and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated:
         if self.ldw.warning:
           self.events.add(EventName.ldw)
@@ -334,35 +333,33 @@ class SelfdriveD:
         self.events.add(EventName.cruiseMismatch)
 
     # Send a "steering required alert" if saturation count has reached the limit
-    lac_log = self.lac_log_prev
     if CS.steeringPressed:
       self.last_steering_pressed_frame = self.sm.frame
     recent_steer_pressed = (self.sm.frame - self.last_steering_pressed_frame)*DT_CTRL < 2.0
-    if self.lac_log_prev is not None and self.lac_log_prev.active and not recent_steer_pressed and not self.CP.notCar:
-      lac_log = self.lac_log_prev
-      if self.CP.lateralTuning.which() == 'torque' and not self.joystick_mode:
-        undershooting = abs(lac_log.desiredLateralAccel) / abs(1e-3 + lac_log.actualLateralAccel) > 1.2
-        turning = abs(lac_log.desiredLateralAccel) > 1.0
-        good_speed = CS.vEgo > 5
-        max_torque = abs(self.sm['carOutput'].actuatorsOutput.steer) > 0.99
-        if undershooting and turning and good_speed and max_torque:
-          self.events.add(EventName.steerSaturated)
-      elif lac_log.saturated:
-        # TODO probably should not use dpath_points but curvature
-        dpath_points = self.sm['modelV2'].position.y
-        if len(dpath_points):
-          # Check if we deviated from the path
-          # TODO use desired vs actual curvature
-          if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
-            steering_value = self.CC_prev.actuators.steeringAngleDeg
-          else:
-            steering_value = self.CC_prev.actuators.steer
-
-          left_deviation = steering_value > 0 and dpath_points[0] < -0.20
-          right_deviation = steering_value < 0 and dpath_points[0] > 0.20
-
-          if left_deviation or right_deviation:
-            self.events.add(EventName.steerSaturated)
+    #if self.lac_log_prev is not None and self.lac_log_prev.active and not recent_steer_pressed and not self.CP.notCar:
+    #  lac_log = self.lac_log_prev
+    #  if self.CP.lateralTuning.which() == 'torque' and not self.joystick_mode:
+    #    undershooting = abs(lac_log.desiredLateralAccel) / abs(1e-3 + lac_log.actualLateralAccel) > 1.2
+    #    turning = abs(lac_log.desiredLateralAccel) > 1.0
+    #    good_speed = CS.vEgo > 5
+    #    max_torque = abs(self.sm['carOutput'].actuatorsOutput.steer) > 0.99
+    #    if undershooting and turning and good_speed and max_torque:
+    #      self.events.add(EventName.steerSaturated)
+    #  elif lac_log.saturated:
+    #    # TODO probably should not use dpath_points but curvature
+    #    dpath_points = self.sm['modelV2'].position.y
+    #    if len(dpath_points):
+    #      # Check if we deviated from the path
+    #      # TODO use desired vs actual curvature
+    #      if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+    #        steering_value = self.sm['carControl'].actuators.steeringAngleDeg
+    #      else:
+    #        steering_value = self.sm['carControl'].actuators.steer
+    #
+    #      left_deviation = steering_value > 0 and dpath_points[0] < -0.20
+    #      right_deviation = steering_value < 0 and dpath_points[0] > 0.20
+    #      if left_deviation or right_deviation:
+    #        self.events.add(EventName.steerSaturated)
 
     # Check for FCW
     stock_long_is_braking = self.enabled and not self.CP.openpilotLongitudinalControl and CS.aEgo < -1.25
@@ -497,7 +494,6 @@ class SelfdriveD:
     self.publish_selfdriveState(CS)
 
     self.CS_prev = CS
-    self.CC_prev = CC
 
   def read_personality_param(self):
     try:
