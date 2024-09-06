@@ -726,7 +726,6 @@ struct SelfdriveState {
 }
 
 struct ControlsState @0x97ff69c53601abf1 {
-  cumLagMs @15 :Float32;
   longitudinalPlanMonoTime @28 :UInt64;
   lateralPlanMonoTime @50 :UInt64;
 
@@ -880,6 +879,7 @@ struct ControlsState @0x97ff69c53601abf1 {
   vCruiseDEPRECATED @22 :Float32;  # actual set speed
   vCruiseClusterDEPRECATED @63 :Float32;  # set speed to display in the UI
   startMonoTimeDEPRECATED @48 :UInt64;
+  cumLagMsDEPRECATED @15 :Float32;
 }
 
 struct DrivingModelData {
